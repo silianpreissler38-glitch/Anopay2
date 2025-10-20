@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+# anopay.py - ano-pay (iSH-compatible)
+# Creator: anopayadmin
+# Start with: python3 anopay.py
+
+import sqlite3
+import time
+import secrets
+import string
+import getpass
+
+DB = "anopay_accounts.db"
+ADMIN_CODE = "SUPERADMIN123"
+ADMIN_USERNAME = "admin"
+ADMIN_PW = "admin123"
+
+# -------------------------
+# Helpers
+# -------------------------
+def now_ts():
+    return int(time.time())
+
+def logo():
+    print("")
+    print("  _   _   _   _   _   _   _   _   _ ")
+    print(" / \\ / \\ / \\ / \\ / \\ / \\ / \\ / \\ / \\")
+    print("| a | n | o | - | p | a | y |       |")
+    print(" \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/")
+    print("")
+    print(" ano-pay")
+    print(" Creator: anopayadmin")
+    print("")
+
+# -------------------------
+# Database init
+# -------------------------
+def init_db():
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    # users: store username, plaintext password, hashed_password(optional), role
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_plain TEXT NOT NULL,
+                    created_at INTEGER,
+                    role TEXT NOT NULL
+                 )''')
+    # balances per username
+    c.execute('''CREATE TABLE IF NOT EXISTS balances (
+                    username TEXT PRIMARY KEY,
+                    balance REAL DEFAULT 0
+                 )''')
+    # vouchers (one-time codes)
+    c.execute('''CREATE TABLE IF NOT EXISTS vouchers (
+                    code TEXT PRIMARY KEY,
+                    amount REAL NOT NULL,
+                    created_at INTEGER,
+                    redeemed_by TEXT,
+                    redeemed_at INTEGER
+                 )''')
+    # withdrawals (simulated payout requests)
+    c.execute('''CREATE TABLE IF NOT EXISTS withdrawals (
+                    id TEXT PRIMARY KEY,
+                    username TEXT,
+                    iban TEXT,
+                    amount REAL,
+                    created_at INTEGER,
+                    status TEXT
+                 )''')
+    # tx ledger
+    c.execute('''CREATE TABLE IF NOT EXISTS txs (
+                    txid TEXT PRIMARY KEY,
+                    type TEXT,
+                    from_user TEXT,
+                    to_user TEXT,
+                    amount REAL,
+                    timestamp INTEGER,
+                    meta TEXT
+                 )''')
+    conn.commit()
+
+    # create admin if missing
+    c.execute('SELECT username FROM users WHERE username = ?', (ADMIN_USERNAME,))
+    if not c.fetchone():
+        c.execute('INSERT INTO users(username, password_plain, created_at, role) VALUES (?, ?, ?, ?)',
+                  (ADMIN_USERNAME, ADMIN_PW, now_ts(), 'admin'))
+        c.execute('INSERT INTO balances(username, balance) VALUES (?, ?)', (ADMIN_USERNAME, 0.0))
+        conn.commit()
+        print("Default admin created (username: admin, password: admin123, admin-code:", ADMIN_CODE, ")")
+    conn.close()
+
+def db_conn():
+    return sqlite3.connect(DB)
+
+# -------------------------
+# Utility functions
+# -------------------------
+def record_tx(txid, tx_type, from_user, to_user, amount, meta=""):
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute('INSERT OR IGNORE INTO txs(txid, type, from_user, to_user, amount, timestamp, meta) VALUES (?, ?, ?, ?, ?, ?, ?)',
+              (txid, tx_type, from_user, to_user, amount, now_ts(), meta))
+    conn.commit()
+    conn.close()
+
+def gen_code(n=12):
+    return secrets.token_urlsafe(n)[:n]
+
+# -------------------------
+# User flows
+# -------------------------
+def register_user():
+    logo()
+    print("Register new user")
+    username = input("Username: ").strip()
+    if not username:
+        print("Username empty.")
+        input("Press ENTER to continue...")
+        return
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute('SELECT username FROM users WHERE username = ?', (username,))
+    if c.fetchone():
+        print("User already exists.")
+        conn.close()
+        input("Press ENTER to continue...")
+        return
+    pw = getpass.getpass("Password (will be stored in DB): ").strip()
+    if not pw:
+        print("Password empty.")
+        conn.close()
+        input("Press ENTER to continue...")
+        return
+    c.execute('INSERT INTO users(username, password_plain, created_at, role) VALUES (?, ?, ?, ?)',
+              (username, pw, now_ts(), 'user'))
+    c.execute('INSERT INTO balances(username, balance) VALUES (?, ?)', (username, 0.0))
+    conn.commit()
+    conn.close()
+    txid = secrets.token_hex(16)
+    record_tx(txid, "register", None, username, 0.0, "user registered")
+    print("User created:", username)
+    input("Press ENTER to continue...")
+
+def login_user():
+    logo()
+    print("User login")
+    username = input("Username: ").strip()
+    pw = getpass.getpass("Password: ").strip()
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute('SELECT role FROM users WHERE username = ? AND password_plain = ?', (username, pw))
+    r = c.fetchone()
+    conn.close()
+    if not r:
+        print("Invalid credentials.")
+        input("Press ENTER to continue...")
+        return None
+    role = r[0]
+    if role != 'user':
+        print("Not a normal user account.")
+        input("Press ENTER to continue...")
+        return None
+    print("Login successful.")
+    return username
+
+def user_menu(username):
+    while True:
+        logo()
+        print("User:", username)
+        print("1) Balance")
+        print("2) Transfer to another user")
+        print("3) Withdraw (request via IBAN)")
+        print("4) Redeem voucher")
+        print("5) Logout")
+        choice = input("Choose: ").strip()
+        if choice == "1":
+            conn = db_conn()
+            c = conn.cursor()
+            c.execute('SELECT balance FROM balances WHERE username = ?', (username,))
+            r = c.fetchone()
+            bal = float(r[0]) if r else 0.0
+            conn.close()
+            print("Balance:", "{:.2f}".format(bal))
+            input("Press ENTER to continue...")
+        elif choice == "2":
+            dest = input("Recipient username: ").strip()
+            if dest == username:
+                print("Cannot transfer to self.")
+                input("Press ENTER to continue...")
+                continue
+            amount_s = input("Amount to send: ").strip()
+            try:
+                amount = float(amount_s)
+                if amount <= 0:
+                    raise ValueError()
+            except:
+                print("Invalid amount.")
+                input("Press ENTER to continue...")
+                continue
+            conn = db_conn()
+            c = conn.cursor()
+            # check recipient exists
+            c.execute('SELECT username FROM users WHERE username = ?', (dest,))
+            if not c.fetchone():
+                print("Recipient does not exist.")
+                conn.close()
+                input("Press ENTER to continue...")
+                continue
+            # check balance
+            c.execute('SELECT balance FROM balances WHERE username = ?', (username,))
+            bal = float(c.fetchone()[0])
+            if amount > bal:
+                print("Insufficient funds.")
+                conn.close()
+                input("Press ENTER to continue...")
+                continue
+            # perform transfer (atomic-ish)
+            new_from = bal - amount
+            c.execute('UPDATE balances SET balance = ? WHERE username = ?', (new_from, username))
+            c.execute('SELECT balance FROM balances WHERE username = ?', (dest,))
+            dest_bal = float(c.fetchone()[0])
+            c.execute('UPDATE balances SET balance = ? WHERE username = ?', (dest_bal + amount, dest))
+            conn.commit()
+            conn.close()
+            txid = secrets.token_hex(16)
+            record_tx(txid, "transfer", username, dest, amount, "user->user")
+            print("Transfer successful.")
+            input("Press ENTER to continue...")
+        elif choice == "3":
+            # Withdraw: request IBAN -> create withdrawal record with status processing
+            iban = input("Enter IBAN for payout (simulation): ").strip()
+            try:
+                amt = float(input("Amount to withdraw: ").strip())
+                if amt <= 0:
+                    raise ValueError()
+            except:
+                print("Invalid amount.")
+                input("Press ENTER to continue...")
+                continue
+            conn = db_conn()
+            c = conn.cursor()
+            c.execute('SELECT balance FROM balances WHERE username = ?', (username,))
+            bal = float(c.fetchone()[0])
+            if amt > bal:
+                print("Insufficient funds.")
+                conn.close()
+                input("Press ENTER to continue...")
+                continue
+            # reserve/debit immediate
+            c.execute('UPDATE balances SET balance = ? WHERE username = ?', (bal - amt, username))
+            wid = secrets.token_hex(12)
+            c.execute('INSERT INTO withdrawals(id, username, iban, amount, created_at, status) VALUES (?, ?, ?, ?, ?, ?)',
+                      (wid, username, iban, amt, now_ts(), 'processing'))
+            conn.commit()
+            conn.close()
+            txid = secrets.token_hex(16)
+            record_tx(txid, "withdraw_request", username, None, amt, "iban:"+iban)
+            print("Withdrawal requested; status: processing.")
+            input("Press ENTER to continue...")
+        elif choice == "4":
+            code = input("Voucher code: ").strip()
+            if not code:
+                print("No code entered.")
+                input("Press ENTER to continue...")
+                continue
+            conn = db_conn()
+            c = conn.cursor()
+            c.execute('SELECT amount, redeemed_by FROM vouchers WHERE code = ?', (code,))
+            r = c.fetchone()
+            if not r:
+                print("Voucher not found.")
+                conn.close()
+                input("Press ENTER to continue...")
+                continue
+            amount, redeemed_by = r
+            if redeemed_by is not None:
+                print("Voucher already redeemed.")
+                conn.close()
+                input("Press ENTER to continue...")
+                continue
+            # redeem
+            c.execute('UPDATE vouchers SET redeemed_by = ?, redeemed_at = ? WHERE code = ?', (username, now_ts(), code))
+            c.execute('SELECT balance FROM balances WHERE username = ?', (username,))
+            bal = float(c.fetchone()[0])
+            c.execute('UPDATE balances SET balance = ? WHERE username = ?', (bal + amount, username))
+            conn.commit()
+            conn.close()
+            txid = secrets.token_hex(16)
+            record_tx(txid, "voucher_redeem", None, username, amount, "code:"+code)
+            print("Voucher redeemed. Amount:", "{:.2f}".format(amount))
+            input("Press ENTER to continue...")
+        elif choice == "5":
+            break
+        else:
+            print("Invalid choice.")
+            input("Press ENTER to continue...")
+
+# -------------------------
+# Admin flows
+# -------------------------
+def login_admin():
+    logo()
+    print("Admin login")
+    code = getpass_input("Admin code: ")
+    if code != ADMIN_CODE:
+        print("Invalid admin code.")
+        input("Press ENTER to continue...")
+        return False
+    username = input("Admin username: ").strip()
+    pw = getpass_input("Admin password: ")
+    conn = db_conn()
+    c = conn.cursor()
+    c.execute('SELECT role FROM users WHERE username = ? AND password_plain = ?', (username, pw))
+    r = c.fetchone()
+    conn.close()
+    if not r or r[0] != 'admin':
+        print("Invalid admin credentials.")
+        input("Press ENTER to continue...")
+        return False
+    return True
+
+def admin_menu():
+    while True:
+        logo()
+        print("Admin Panel")
+        print("1) View all users (incl. passwords)")
+        print("2) Adjust user balance")
+        print("3) Create voucher")
+        print("4) View vouchers")
+        print("5) Delete voucher (only if not redeemed)")
+        print("6) View withdrawals")
+        print("7) Mark withdrawal completed")
+        print("8) Logout")
+        choice = input("Choose: ").strip()
+        conn = db_conn()
+        c = conn.cursor()
+        if choice == "1":
+            print("Users:")
+            for row in c.execute('SELECT u.username, u.password_plain, IFNULL(b.balance,0) FROM users u LEFT JOIN balances b ON u.username = b.username ORDER BY u.username'):
+                uname, pw_plain, bal = row
+                print(" -", uname, "| password:", pw_plain, "| balance:", "{:.2f}".format(bal))
+            input("Press ENTER to continue...")
+        elif choice == "2":
+            uname = input("Target username: ").strip()
+            try:
+                new_bal = float(input("Set new balance: ").strip())
+            except:
+                print("Invalid amount.")
+                input("Press ENTER to continue...")
+                continue
+            c.execute('UPDATE balances SET balance = ? WHERE username = ?', (new_bal, uname))
+            conn.commit()
+            txid = secrets.token_hex(16)
+            record_tx(txid, "admin_set_balance", None, uname, new_bal, "admin adjusted balance")
+            print("Balance updated.")
+            input("Press ENTER to continue...")
+        elif choice == "3":
+            try:
+                amount = float(input("Voucher amount: ").strip())
+                if amount <= 0:
+                    raise ValueError()
+            except:
+                print("Invalid amount.")
+                input("Press ENTER to continue...")
+                continue
+            code = gen_code(12)
+            c.execute('INSERT INTO vouchers(code, amount, created_at, redeemed_by, redeemed_at) VALUES (?, ?, ?, ?, ?)',
+                      (code, amount, now_ts(), None, None))
+            conn.commit()
+            txid = secrets.token_hex(16)
+            record_tx(txid, "voucher_create", None, None, amount, "code:"+code)
+            print("Voucher created. Code:", code)
+            input("Press ENTER to continue...")
+        elif choice == "4":
+            print("Vouchers:")
+            rows = c.execute('SELECT code, amount, created_at, redeemed_by, redeemed_at FROM vouchers ORDER BY created_at DESC').fetchall()
+            if not rows:
+                print("No vouchers.")
+            else:
+                for r in rows:
+                    code, amount, created_at, redeemed_by, redeemed_at = r
+                    created_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+                    redeemed_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(redeemed_at)) if redeemed_at else "-"
+                    redeemed_by = redeemed_by if redeemed_by else "-"
+                    print(code, "|", "{:.2f}".format(amount), "| created:", created_s, "| redeemed_by:", redeemed_by, "| redeemed_at:", redeemed_s)
+            input("Press ENTER to continue...")
+        elif choice == "5":
+            code = input("Voucher code to delete: ").strip()
+            c.execute('SELECT redeemed_by FROM vouchers WHERE code = ?', (code,))
+            r = c.fetchone()
+            if not r:
+                print("Voucher not found.")
+            elif r[0] is not None:
+                print("Voucher already redeemed; cannot delete.")
+            else:
+                c.execute('DELETE FROM vouchers WHERE code = ?', (code,))
+                conn.commit()
+                print("Voucher deleted.")
+            input("Press ENTER to continue...")
+        elif choice == "6":
+            print("Withdrawals:")
+            rows = c.execute('SELECT id, username, iban, amount, created_at, status FROM withdrawals ORDER BY created_at DESC').fetchall()
+            if not rows:
+                print("No withdrawals.")
+            else:
+                for r in rows:
+                    wid, uname, iban, amt, created_at, status = r
+                    created_s = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
+                    print("ID:", wid, "| user:", uname, "| iban:", iban, "| amt:", "{:.2f}".format(amt), "| created:", created_s, "| status:", status)
+            input("Press ENTER to continue...")
+        elif choice == "7":
+            wid = input("Withdrawal ID to mark completed: ").strip()
+            c.execute('SELECT id FROM withdrawals WHERE id = ?', (wid,))
+            if not c.fetchone():
+                print("Withdrawal ID not found.")
+            else:
+                c.execute('UPDATE withdrawals SET status = ? WHERE id = ?', ('completed', wid))
+                conn.commit()
+                print("Marked completed.")
+                txid = secrets.token_hex(16)
+                record_tx(txid, "withdraw_completed", None, None, 0.0, "withdraw:"+wid)
+            input("Press ENTER to continue...")
+        elif choice == "8":
+            conn.close()
+            break
+        else:
+            print("Invalid choice.")
+            input("Press ENTER to continue...")
+        conn.close()
+
+# -------------------------
+# Utilities for secure input if getpass missing in some iSH builds
+# -------------------------
+def getpass_input(prompt):
+    try:
+        return getpass.getpass(prompt)
+    except Exception:
+        # fallback if getpass not supported
+        return input(prompt)
+
+# -------------------------
+# Main menu
+# -------------------------
+def main():
+    init_db()
+    while True:
+        logo()
+        print("Main Menu")
+        print("1) Login (user)")
+        print("2) Register (user)")
+        print("3) Login (admin)")
+        print("4) Exit")
+        choice = input("Choose: ").strip()
+        if choice == "1":
+            u = login_user()
+            if u:
+                user_menu(u)
+        elif choice == "2":
+            register_user()
+        elif choice == "3":
+            ok = login_admin()
+            if ok:
+                admin_menu()
+        elif choice == "4":
+            print("Bye.")
+            break
+        else:
+            print("Invalid choice.")
+            input("Press ENTER to continue...")
+
+if __name__ == "__main__":
+    main()
